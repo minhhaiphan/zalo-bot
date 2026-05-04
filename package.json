@@ -1,0 +1,19 @@
+{
+  "name": "zalo-bot",
+  "version": "1.0.0",
+  "description": "A basic Zalo bot using zca-js",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@woocommerce/woocommerce-rest-api": "^1.0.1",
+    "axios": "^1.8.1",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "open": "^10.1.0",
+    "zca-js": "^2.0.0-beta.9"
+  }
+}
