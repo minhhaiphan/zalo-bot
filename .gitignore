@@ -1,6 +1,12 @@
 node_modules/
 .env
 tokens.json
+tokens.json.backup.*
 qr.png
 *.log
 .DS_Store
+
+# Runtime state files (chứa dữ liệu khách hàng, thay đổi liên tục)
+shopee-mail-state.json
+pending-orders.json
+pending-fb-messages.json
