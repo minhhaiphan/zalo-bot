@@ -3,14 +3,131 @@ import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
 import open from 'open';
-import { Zalo, ThreadType, Urgency, TextStyle } from "zca-js";
+import { Zalo, ThreadType, Urgency, TextStyle, LoginQRCallbackEventType } from "zca-js";
 import fs from 'fs/promises';
+import { createReadStream, watch as fsWatch, statSync } from 'fs';
+import FormData from 'form-data';
 import path from 'path';
+import { startShopeeMailWatcher } from './shopee-mail-watcher.js';
 dotenv.config();
+
+// ============ Telegram notify (QR login) =====================================
+const TG_BOT_TOKEN = '8063961851:AAFYVxLJaSORfO3u_qmJswxZNezlhPQzzSA';
+const TG_CHAT_ID = '1694047566';
+
+async function sendTelegramText(text) {
+  try {
+    await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+      chat_id: TG_CHAT_ID,
+      text,
+    });
+  } catch (err) {
+    console.error('sendTelegramText error:', err.response?.data || err.message);
+  }
+}
+
+async function sendTelegramPhoto(filePath, caption) {
+  try {
+    const form = new FormData();
+    form.append('chat_id', TG_CHAT_ID);
+    form.append('caption', caption || '');
+    form.append('photo', createReadStream(filePath));
+    await axios.post(
+      `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`,
+      form,
+      { headers: form.getHeaders() }
+    );
+  } catch (err) {
+    console.error('sendTelegramPhoto error:', err.response?.data || err.message);
+  }
+}
+// ===========================================================================
 
 const app = express();
 app.use(express.json()); // Middleware to parse JSON request bodies
 const processedOrders = new Set();
+
+// ============ Pending orders tracking (cảnh báo đơn web chưa có GHTK) ============
+const PENDING_ORDERS_FILE = './pending-orders.json';
+const WARN_AFTER_MS = 5 * 60 * 60 * 1000;   // 5h
+const CLEANUP_AFTER_MS = 24 * 60 * 60 * 1000; // 24h
+const CHECK_INTERVAL_MS = 10 * 60 * 1000;   // 10 phút
+
+let pendingOrders = {};
+
+function normalizePhone(phone) {
+  if (!phone) return '';
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.startsWith('84')) return '0' + digits.slice(2);
+  return digits;
+}
+
+async function loadPending() {
+  try {
+    const raw = await fs.readFile(PENDING_ORDERS_FILE, 'utf8');
+    pendingOrders = JSON.parse(raw);
+    console.log(`Loaded ${Object.keys(pendingOrders).length} pending orders`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('loadPending error:', err);
+    pendingOrders = {};
+  }
+}
+
+async function savePending() {
+  try {
+    await fs.writeFile(PENDING_ORDERS_FILE, JSON.stringify(pendingOrders, null, 2));
+  } catch (err) {
+    console.error('savePending error:', err);
+  }
+}
+// ===============================================================================
+
+// ============ Pending FB messages tracking (cảnh báo tin fanpage chưa reply) ====
+const PENDING_FB_FILE = './pending-fb-messages.json';
+const FB_WARN_AFTER_MS = 30 * 60 * 1000;       // 30 phút
+const FB_CLEANUP_AFTER_MS = 24 * 60 * 60 * 1000; // 24h
+const FB_CHECK_INTERVAL_MS = 5 * 60 * 1000;    // 5 phút
+
+let pendingFbMessages = {};
+
+async function loadPendingFb() {
+  try {
+    const raw = await fs.readFile(PENDING_FB_FILE, 'utf8');
+    pendingFbMessages = JSON.parse(raw);
+    console.log(`Loaded ${Object.keys(pendingFbMessages).length} pending FB messages`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('loadPendingFb error:', err);
+    pendingFbMessages = {};
+  }
+}
+
+async function savePendingFb() {
+  try {
+    await fs.writeFile(PENDING_FB_FILE, JSON.stringify(pendingFbMessages, null, 2));
+  } catch (err) {
+    console.error('savePendingFb error:', err);
+  }
+}
+
+async function fetchFbUserName(userId) {
+  try {
+    const res = await axios.get(`https://graph.facebook.com/v18.0/${FB_PAGE_ID}/conversations`, {
+      params: {
+        platform: 'messenger',
+        user_id: userId,
+        fields: 'participants',
+        access_token: process.env.PAGE_ACCESS_TOKEN,
+      }
+    });
+    const participants = res.data?.data?.[0]?.participants?.data || [];
+    const customer = participants.find(p => p.id === userId);
+    return customer?.name || userId;
+  } catch (err) {
+    console.error('fetchFbUserName error:', err.response?.data || err.message);
+    return userId;
+  }
+}
+// ===============================================================================
 
 // Load Shopee credentials from .env file
 const PARTNER_ID = parseInt(process.env.PARTNER_ID, 10);
@@ -22,6 +139,7 @@ if (isNaN(PARTNER_ID)) {
 const SHOPEE_GROUP_ID = '7949012490991271952';
 const GHTK_GROUP_ID = '2762352261273079061';
 const TT_GROUP_ID = '6734200390978148148';
+const FB_PAGE_ID = '332050010967075';
 const PARTNER_KEY = process.env.PARTNER_KEY;
 const REDIRECT_URL = process.env.REDIRECT_URL;
 let ACCESS_TOKEN = null;
@@ -29,7 +147,29 @@ let REFRESH_TOKEN = null;
 const zalo = new Zalo({
   selfListen: false,
 });
+// Watch qr.png → mỗi lần file đổi → gửi qua Telegram (debounce 3s tránh trùng)
+let qrLastSentAt = 0;
+let qrWatcher = null;
+try {
+  qrWatcher = fsWatch('./qr.png', async () => {
+    const now = Date.now();
+    if (now - qrLastSentAt < 3000) return;
+    qrLastSentAt = now;
+    try {
+      await new Promise(r => setTimeout(r, 400)); // chờ file ghi xong
+      console.log('QR file changed → gửi Telegram');
+      await sendTelegramPhoto('./qr.png', '🔐 Quét QR để đăng nhập Zalo bot');
+    } catch (err) {
+      console.error('qr watch handler error:', err.message);
+    }
+  });
+} catch (err) {
+  console.error('fsWatch qr.png error:', err.message);
+}
+
 const api = await zalo.loginQR();
+if (qrWatcher) qrWatcher.close();
+await sendTelegramText('🟢 Zalo bot đã đăng nhập thành công');
 
 await api.getAllGroups()
     .then(console.log)
@@ -114,7 +254,33 @@ app.post('/fb/post-notify', async (req, res) => {
           message: { text: replyMessage }
         });
       }
-    
+
+      // ===== Theo dõi tin nhắn fanpage chưa được phản hồi =====
+      if (event.message && event.message.text) {
+        // Page reply (admin trả lời qua inbox) → xóa pending của khách
+        if (event.message.is_echo) {
+          const customerId = event.recipient?.id;
+          if (customerId && pendingFbMessages[customerId]) {
+            console.log(`FB admin đã reply khách ${customerId}, xóa khỏi pending`);
+            delete pendingFbMessages[customerId];
+            await savePendingFb();
+          }
+        }
+        // Khách gửi tin → upsert pending (reset lastMessageAt + warned)
+        else if (senderId && senderId !== FB_PAGE_ID) {
+          const existing = pendingFbMessages[senderId];
+          const customerName = existing?.customerName || await fetchFbUserName(senderId);
+          pendingFbMessages[senderId] = {
+            customerId: senderId,
+            customerName,
+            lastMessageAt: Date.now(),
+            lastMessagePreview: event.message.text.slice(0, 100),
+            warned: false,
+          };
+          await savePendingFb();
+          console.log(`FB khách ${customerName} (${senderId}) nhắn → pending`);
+        }
+      }
     });
   }); //forEach entries
   
@@ -634,6 +800,15 @@ Khách đặt sau 20h30 thì để sáng hôm sau gọi xác nhận.
         ]
       }, TT_GROUP_ID, ThreadType.Group);
       console.log("Order notification sent successfully");
+
+      pendingOrders[order.id] = {
+        orderId: order.id,
+        phone: normalizePhone(billing.phone),
+        customerName: billing.first_name,
+        createdAt: Date.now(),
+        warned: false,
+      };
+      await savePending();
     } catch (error) {
       console.error("Failed to send order notification:", error);
     }
@@ -719,9 +894,10 @@ async function getShipmentInfo(labelId) {
                         `Ngày lấy hàng: ${new Date(order.pick_date).toLocaleString("vi-VN")}`;
         
         console.log('Tin nhắn:', message);
-       return message
+       return { message, customer_tel: order.customer_tel, customer_fullname: order.customer_fullname };
     } catch (error) {
         console.error('Error:', error.response ? error.response.data : error.message);
+        return null;
     }
 }
 
@@ -731,8 +907,22 @@ const queue = [];
 app.post("/ghtk-webhook", async (req, res) => {
 try {  
       console.log({body:req.body})
-      const customer_msg = await getShipmentInfo(req.body.label_id)
+      const shipment = await getShipmentInfo(req.body.label_id)
+      const customer_msg = shipment?.message || ''
       const msg = `Đơn GHTK mã: ${req.body.label_id}. Trạng thái:${statusMap[req?.body?.status_id] || "Trạng thái không xác định"}\n ${customer_msg}\n ${req.body.reason}`
+
+      // Match đơn GHTK với pending web order theo SĐT → xóa khỏi pending
+      const ghtkPhone = normalizePhone(shipment?.customer_tel);
+      if (ghtkPhone) {
+        const matched = Object.values(pendingOrders)
+          .filter(p => p.phone === ghtkPhone)
+          .sort((a, b) => a.createdAt - b.createdAt)[0];
+        if (matched) {
+          console.log(`GHTK matched với đơn web #${matched.orderId} (phone ${ghtkPhone}), xóa khỏi pending`);
+          delete pendingOrders[matched.orderId];
+          await savePending();
+        }
+      }
       
       const now = new Date();
       const hour = now.getHours();
@@ -783,8 +973,117 @@ const PORT = process.env.PORT || 8081;
 
 const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  
+
   // Load tokens after the server has started
   // This ensures the server is up and running even if token loading fails
   loadTokens()
+
+  // Load pending orders + start scheduler kiểm tra đơn web chưa có GHTK
+  loadPending().then(() => {
+    setInterval(checkPendingOrders, CHECK_INTERVAL_MS);
+    console.log(`Pending-orders scheduler started (check mỗi ${CHECK_INTERVAL_MS / 60000} phút)`);
+  });
+
+  // Load pending FB messages + start scheduler nhắc tin fanpage chưa reply
+  loadPendingFb().then(() => {
+    setInterval(checkPendingFbMessages, FB_CHECK_INTERVAL_MS);
+    console.log(`Pending-FB scheduler started (check mỗi ${FB_CHECK_INTERVAL_MS / 60000} phút)`);
+  });
+
+  // Mail watcher → Shopee alerts (group Shopee) + Callback request (group TT)
+  startShopeeMailWatcher({
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD,
+    onAlert: async ({ msg, type }) => {
+      const targetGroup = type === 'callback' ? TT_GROUP_ID : SHOPEE_GROUP_ID;
+      await api.sendMessage({
+        msg,
+        urgency: Urgency.Important,
+        styles: [
+          { start: 0, len: msg.length, st: TextStyle.Bold },
+          { start: 0, len: msg.length, st: TextStyle.Big },
+        ],
+      }, targetGroup, ThreadType.Group);
+    },
+  });
 });
+
+async function checkPendingFbMessages() {
+  const now = Date.now();
+  let changed = false;
+
+  for (const customerId of Object.keys(pendingFbMessages)) {
+    const p = pendingFbMessages[customerId];
+    const age = now - p.lastMessageAt;
+
+    if (age >= FB_CLEANUP_AFTER_MS) {
+      console.log(`Cleanup FB pending ${customerId} (quá 24h)`);
+      delete pendingFbMessages[customerId];
+      changed = true;
+      continue;
+    }
+
+    if (age >= FB_WARN_AFTER_MS && !p.warned) {
+      const warnMsg = `⚠️ Tin nhắn fanpage chưa được phản hồi (>30 phút)
+👤 ${p.customerName}
+💬 "${p.lastMessagePreview}"
+🕐 Khách nhắn: ${new Date(p.lastMessageAt).toLocaleString("vi-VN")}
+
+→ Mở Facebook Inbox để trả lời khách`;
+      try {
+        await api.sendMessage({
+          msg: warnMsg,
+          urgency: Urgency.Important,
+          styles: [{ start: 0, len: warnMsg.length, st: TextStyle.Bold }],
+        }, TT_GROUP_ID, ThreadType.Group);
+        p.warned = true;
+        changed = true;
+        console.log(`Đã gửi cảnh báo FB cho khách ${customerId}`);
+      } catch (err) {
+        console.error(`Failed to send FB warning for ${customerId}:`, err);
+      }
+    }
+  }
+
+  if (changed) await savePendingFb();
+}
+
+async function checkPendingOrders() {
+  const now = Date.now();
+  let changed = false;
+
+  for (const orderId of Object.keys(pendingOrders)) {
+    const p = pendingOrders[orderId];
+    const age = now - p.createdAt;
+
+    if (age >= CLEANUP_AFTER_MS) {
+      console.log(`Cleanup pending đơn web #${orderId} (quá 24h)`);
+      delete pendingOrders[orderId];
+      changed = true;
+      continue;
+    }
+
+    if (age >= WARN_AFTER_MS && !p.warned) {
+      const warnMsg = `⚠️ Đơn web #${p.orderId} đã quá 5h chưa có đơn GHTK
+👤 ${p.customerName} — 📞 ${p.phone}
+📅 Đặt lúc: ${new Date(p.createdAt).toLocaleString("vi-VN")}
+
+→ Vui lòng kiểm tra và tạo đơn GHTK
+(Bỏ qua tin này nếu khách đã hủy đơn)`;
+      try {
+        await api.sendMessage({
+          msg: warnMsg,
+          urgency: Urgency.Important,
+          styles: [{ start: 0, len: warnMsg.length, st: TextStyle.Bold }],
+        }, TT_GROUP_ID, ThreadType.Group);
+        p.warned = true;
+        changed = true;
+        console.log(`Đã gửi cảnh báo cho đơn web #${orderId}`);
+      } catch (err) {
+        console.error(`Failed to send warning for order #${orderId}:`, err);
+      }
+    }
+  }
+
+  if (changed) await savePending();
+}
