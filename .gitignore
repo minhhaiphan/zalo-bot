@@ -8,5 +8,7 @@ qr.png
 
 # Runtime state files (chứa dữ liệu khách hàng, thay đổi liên tục)
 shopee-mail-state.json
+shopee-reviews-state.json
+shopee-chat-state.json
 pending-orders.json
 pending-fb-messages.json

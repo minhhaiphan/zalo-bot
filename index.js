@@ -140,6 +140,7 @@ const SHOPEE_GROUP_ID = '7949012490991271952';
 const GHTK_GROUP_ID = '2762352261273079061';
 const TT_GROUP_ID = '6734200390978148148';
 const FB_PAGE_ID = '332050010967075';
+const SHOPEE_SHOP_ID = 293078696;
 const PARTNER_KEY = process.env.PARTNER_KEY;
 const REDIRECT_URL = process.env.REDIRECT_URL;
 let ACCESS_TOKEN = null;
@@ -603,6 +604,293 @@ async function refreshAccessToken(shop_id) {
     }
 }
 
+// ============ Shopee Shop-Outgoing Chat Monitoring =======================
+const CHAT_STATE_FILE = './shopee-chat-state.json';
+const CHAT_CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 phút
+let chatState = { lastShopMessageTime: 0 };
+const sentChatMessageIds = new Set();
+
+async function loadChatState() {
+  try {
+    const raw = await fs.readFile(CHAT_STATE_FILE, 'utf8');
+    chatState = JSON.parse(raw);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('loadChatState error:', err);
+    chatState = { lastShopMessageTime: Math.floor(Date.now() / 1000) };
+    await saveChatState();
+    console.log('Khởi tạo chat state, chỉ monitor tin shop gửi từ giờ');
+  }
+}
+
+async function saveChatState() {
+  try {
+    await fs.writeFile(CHAT_STATE_FILE, JSON.stringify(chatState, null, 2));
+  } catch (err) {
+    console.error('saveChatState error:', err);
+  }
+}
+
+async function fetchConversationList() {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const path = '/api/v2/sellerchat/get_conversation_list';
+  const sign = generateSign(`${PARTNER_ID}${path}${timestamp}${ACCESS_TOKEN}${SHOPEE_SHOP_ID}`);
+  try {
+    const response = await axios.get(`https://partner.shopeemobile.com${path}`, {
+      params: {
+        partner_id: PARTNER_ID,
+        timestamp,
+        access_token: ACCESS_TOKEN,
+        shop_id: SHOPEE_SHOP_ID,
+        sign,
+        direction: 'latest',
+        type: 'all',
+        page_size: 25,
+      },
+    });
+    return response.data;
+  } catch (err) {
+    console.error('fetchConversationList error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function fetchMessageList(conversationId) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const path = '/api/v2/sellerchat/get_message';
+  const sign = generateSign(`${PARTNER_ID}${path}${timestamp}${ACCESS_TOKEN}${SHOPEE_SHOP_ID}`);
+  try {
+    const response = await axios.get(`https://partner.shopeemobile.com${path}`, {
+      params: {
+        partner_id: PARTNER_ID,
+        timestamp,
+        access_token: ACCESS_TOKEN,
+        shop_id: SHOPEE_SHOP_ID,
+        sign,
+        conversation_id: conversationId,
+        page_size: 20,
+      },
+    });
+    return response.data;
+  } catch (err) {
+    console.error('fetchMessageList error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+function describeChatContent(m) {
+  const type = m.message_type || '';
+  const c = m.content || {};
+  switch (type) {
+    case 'text':       return c.text || '(text rỗng)';
+    case 'image':      return '[📷 Hình ảnh]';
+    case 'sticker':    return '[😀 Sticker]';
+    case 'voice':      return '[🎤 Voice]';
+    case 'video':      return '[🎬 Video]';
+    case 'file':       return '[📎 File]';
+    case 'item':       return `[🛒 Sản phẩm${c.item_id ? ` ID ${c.item_id}` : ''}]`;
+    case 'order':      return `[📦 Đơn hàng${c.order_sn ? ` ${c.order_sn}` : ''}]`;
+    case 'voucher':    return '[🎟️ Voucher]';
+    case 'bargain_chat': return '[💱 Trả giá]';
+    default:           return `[${type || 'tin'}]`;
+  }
+}
+
+async function checkShopOutgoingChats() {
+  if (!ACCESS_TOKEN) {
+    console.log('checkShopOutgoingChats: chưa có ACCESS_TOKEN, skip');
+    return;
+  }
+
+  let resp = await fetchConversationList();
+  if (resp?.error === 'error_auth' || resp?.error === 'invalid_access_token') {
+    console.log('Access token hết hạn, refresh...');
+    const refreshed = await refreshAccessToken(SHOPEE_SHOP_ID);
+    if (!refreshed) return;
+    resp = await fetchConversationList();
+  }
+
+  const conversations = resp?.response?.conversations || [];
+  if (conversations.length === 0) return;
+
+  const candidates = conversations.filter(c =>
+    Number(c.last_message_from_id) === Number(SHOPEE_SHOP_ID) &&
+    (c.last_message_timestamp || 0) > chatState.lastShopMessageTime
+  );
+
+  if (candidates.length === 0) return;
+  console.log(`Found ${candidates.length} conversation(s) có tin shop mới`);
+
+  let newest = chatState.lastShopMessageTime;
+  const toSend = [];
+
+  for (const conv of candidates) {
+    const msgResp = await fetchMessageList(conv.conversation_id);
+    const messages = msgResp?.response?.messages || [];
+    for (const m of messages) {
+      const t = m.created_timestamp || 0;
+      if (Number(m.from_id) !== Number(SHOPEE_SHOP_ID)) continue;
+      if (t <= chatState.lastShopMessageTime) continue;
+      if (sentChatMessageIds.has(m.message_id)) continue;
+      toSend.push({ conv, m });
+      if (t > newest) newest = t;
+    }
+  }
+
+  toSend.sort((a, b) => (a.m.created_timestamp || 0) - (b.m.created_timestamp || 0));
+
+  for (const { conv, m } of toSend) {
+    const buyerName = conv.to_name || conv.to_id || 'khách';
+    const content = describeChatContent(m);
+    const time = new Date((m.created_timestamp || 0) * 1000).toLocaleString('vi-VN');
+    const msg = `📤 Shop nhắn khách\n👤 Khách: ${buyerName}\n💬 ${content}\n🕐 ${time}`;
+    try {
+      await api.sendMessage({
+        msg,
+        urgency: Urgency.Important,
+        styles: [
+          { start: 0, len: msg.length, st: TextStyle.Bold },
+          { start: 0, len: msg.length, st: TextStyle.Big },
+        ],
+      }, SHOPEE_GROUP_ID, ThreadType.Group);
+      sentChatMessageIds.add(m.message_id);
+      console.log(`Đã gửi tin shop→khách ${buyerName} (${m.message_id})`);
+    } catch (err) {
+      console.error('Send shop chat to Zalo error:', err);
+    }
+  }
+
+  if (newest > chatState.lastShopMessageTime) {
+    chatState.lastShopMessageTime = newest;
+    await saveChatState();
+  }
+}
+// ===========================================================================
+
+// ============ Shopee Reviews Polling =====================================
+const REVIEW_STATE_FILE = './shopee-reviews-state.json';
+const REVIEW_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1h
+let reviewState = { lastCommentTime: 0 };
+const sentCommentIds = new Set();
+
+async function loadReviewState() {
+  try {
+    const raw = await fs.readFile(REVIEW_STATE_FILE, 'utf8');
+    reviewState = JSON.parse(raw);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('loadReviewState error:', err);
+    reviewState = { lastCommentTime: Math.floor(Date.now() / 1000) };
+    await saveReviewState();
+    console.log('Khởi tạo review state, chỉ xử lý review mới từ giờ');
+  }
+}
+
+async function saveReviewState() {
+  try {
+    await fs.writeFile(REVIEW_STATE_FILE, JSON.stringify(reviewState, null, 2));
+  } catch (err) {
+    console.error('saveReviewState error:', err);
+  }
+}
+
+async function fetchShopeeComments(cursor = '') {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const path = '/api/v2/product/get_comment';
+  const sign = generateSign(`${PARTNER_ID}${path}${timestamp}${ACCESS_TOKEN}${SHOPEE_SHOP_ID}`);
+
+  try {
+    const response = await axios.get(`https://partner.shopeemobile.com${path}`, {
+      params: {
+        partner_id: PARTNER_ID,
+        timestamp,
+        access_token: ACCESS_TOKEN,
+        shop_id: SHOPEE_SHOP_ID,
+        sign,
+        cursor,
+        page_size: 50,
+      },
+    });
+    return response.data;
+  } catch (err) {
+    console.error('fetchShopeeComments error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+function buildReviewMessage(c) {
+  const stars = '⭐'.repeat(Math.max(1, Math.min(5, c.rating_star || 0)));
+  const product = c.item_id ? `Sản phẩm ID: ${c.item_id}` : '(SP không xác định)';
+  const buyer = c.buyer_username || 'Khách ẩn danh';
+  const text = (c.comment || '').slice(0, 500) || '(không có nội dung)';
+  let msg = `${stars} ĐÁNH GIÁ MỚI (${c.rating_star || '?'}/5)\n📦 ${product}\n👤 ${buyer}\n💬 ${text}`;
+  if ((c.rating_star || 5) <= 3) msg += `\n⚠️ Cần phản hồi gấp`;
+  msg += `\n→ Vào Shopee Seller Center reply`;
+  return msg;
+}
+
+async function checkShopeeReviews() {
+  if (!ACCESS_TOKEN) {
+    console.log('checkShopeeReviews: chưa có ACCESS_TOKEN, skip');
+    return;
+  }
+
+  let cursor = '';
+  let newest = reviewState.lastCommentTime;
+  const newComments = [];
+
+  for (let page = 0; page < 10; page++) {
+    let resp = await fetchShopeeComments(cursor);
+
+    if (resp?.error === 'error_auth' || resp?.error === 'invalid_access_token') {
+      console.log('Access token hết hạn, refresh...');
+      const refreshed = await refreshAccessToken(SHOPEE_SHOP_ID);
+      if (!refreshed) return;
+      resp = await fetchShopeeComments(cursor);
+    }
+
+    const items = resp?.response?.item_comment_list || [];
+    if (items.length === 0) break;
+
+    let stop = false;
+    for (const c of items) {
+      const t = c.create_time || 0;
+      if (t <= reviewState.lastCommentTime) { stop = true; continue; }
+      if (sentCommentIds.has(c.comment_id)) continue;
+      newComments.push(c);
+      if (t > newest) newest = t;
+    }
+
+    if (stop || !resp?.response?.more) break;
+    cursor = resp.response.next_cursor || '';
+    if (!cursor) break;
+  }
+
+  newComments.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
+
+  for (const c of newComments) {
+    try {
+      const msg = buildReviewMessage(c);
+      await api.sendMessage({
+        msg,
+        urgency: Urgency.Important,
+        styles: [
+          { start: 0, len: msg.length, st: TextStyle.Bold },
+          { start: 0, len: msg.length, st: TextStyle.Big },
+        ],
+      }, SHOPEE_GROUP_ID, ThreadType.Group);
+      sentCommentIds.add(c.comment_id);
+      console.log(`Đã gửi review ${c.comment_id} (${c.rating_star}*)`);
+    } catch (err) {
+      console.error('Send review to Zalo error:', err);
+    }
+  }
+
+  if (newest > reviewState.lastCommentTime) {
+    reviewState.lastCommentTime = newest;
+    await saveReviewState();
+  }
+}
+// ===========================================================================
+
 /**
  * Step 5: Webhook Listener for Order Status Updates
  */
@@ -772,7 +1060,7 @@ async function processOrder(order) {
 🛍️ Sản phẩm đã mua:\n${productDetails}
 💳 Hình thức thanh toán: ${payment_method_title}
 📍 IP khách hàng: ${customer_ip_address}
-📅 Ngày tạo: ${new Date(date_created).toLocaleString("vi-VN")}
+📅 Ngày tạo: ${new Date(date_created).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })}
 Nhận đơn với cú pháp: "Nhận đơn (hoặc E nhận)"
 Thao tác sau khi nhận đơn: 
 - Gọi cho khách theo số đth trên để xác nhận (có trường họp khách đặt linh tinh)
@@ -891,7 +1179,7 @@ async function getShipmentInfo(labelId) {
                         `SĐT: ${order.customer_tel}\n` +
                         `Địa chỉ: ${order.address}\n` +
                         `Số tiền thu hộ: ${Number(order.pick_money).toLocaleString()}VND\n` +
-                        `Ngày lấy hàng: ${new Date(order.pick_date).toLocaleString("vi-VN")}`;
+                        `Ngày lấy hàng: ${new Date(order.pick_date).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })}`;
         
         console.log('Tin nhắn:', message);
        return { message, customer_tel: order.customer_tel, customer_fullname: order.customer_fullname };
@@ -990,6 +1278,20 @@ const server = app.listen(PORT, () => {
     console.log(`Pending-FB scheduler started (check mỗi ${FB_CHECK_INTERVAL_MS / 60000} phút)`);
   });
 
+  // Shopee reviews polling (mỗi 1h)
+  loadReviewState().then(() => {
+    setTimeout(checkShopeeReviews, 60_000); // chạy lần đầu sau 1 phút (chờ token load)
+    setInterval(checkShopeeReviews, REVIEW_CHECK_INTERVAL_MS);
+    console.log(`Shopee reviews scheduler started (check mỗi ${REVIEW_CHECK_INTERVAL_MS / 60000} phút)`);
+  });
+
+  // Shopee shop-outgoing chat monitoring (mỗi 15 phút)
+  loadChatState().then(() => {
+    setTimeout(checkShopOutgoingChats, 90_000); // chạy sau 1.5 phút (sau reviews)
+    setInterval(checkShopOutgoingChats, CHAT_CHECK_INTERVAL_MS);
+    console.log(`Shopee chat-monitor scheduler started (check mỗi ${CHAT_CHECK_INTERVAL_MS / 60000} phút)`);
+  });
+
   // Mail watcher → Shopee alerts (group Shopee) + Callback request (group TT)
   startShopeeMailWatcher({
     user: process.env.GMAIL_USER,
@@ -1027,7 +1329,7 @@ async function checkPendingFbMessages() {
       const warnMsg = `⚠️ Tin nhắn fanpage chưa được phản hồi (>30 phút)
 👤 ${p.customerName}
 💬 "${p.lastMessagePreview}"
-🕐 Khách nhắn: ${new Date(p.lastMessageAt).toLocaleString("vi-VN")}
+🕐 Khách nhắn: ${new Date(p.lastMessageAt).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })}
 
 → Mở Facebook Inbox để trả lời khách`;
       try {
@@ -1066,7 +1368,7 @@ async function checkPendingOrders() {
     if (age >= WARN_AFTER_MS && !p.warned) {
       const warnMsg = `⚠️ Đơn web #${p.orderId} đã quá 5h chưa có đơn GHTK
 👤 ${p.customerName} — 📞 ${p.phone}
-📅 Đặt lúc: ${new Date(p.createdAt).toLocaleString("vi-VN")}
+📅 Đặt lúc: ${new Date(p.createdAt).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })}
 
 → Vui lòng kiểm tra và tạo đơn GHTK
 (Bỏ qua tin này nếu khách đã hủy đơn)`;
